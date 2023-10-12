@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: UNLICENSED
-pragma solidity ^0.8.9;
+pragma solidity ^0.8.20;
 
-import "@openzeppelin/contracts/access/Ownable.sol";
-import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
-import "@openzeppelin/contracts/utils/Address.sol";
-import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
-import "@openzeppelin/contracts/utils/cryptography/draft-EIP712.sol";
-// import {IERC721A, ERC721A} from "erc721a/contracts/ERC721A.sol";
-import {ERC721, IERC721} from "@openzeppelin/contracts/token/ERC721/ERC721.sol";
+import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/AddressUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/cryptography/ECDSAUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/cryptography/draft-EIP712Upgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/cryptography/MerkleProofUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC721/ERC721Upgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import "./IFeeStructure.sol";
 
 /*
@@ -28,8 +29,15 @@ import "./IFeeStructure.sol";
 /// @title GEEGS
 /// @author rektt (https://twitter.com/aceplxx)
 
-contract Geegs is ERC721, Ownable, ReentrancyGuard, EIP712 {
-    using Address for address payable;
+contract Geegs is
+    Initializable,
+    OwnableUpgradeable,
+    ReentrancyGuardUpgradeable,
+    ERC721Upgradeable,
+    EIP712Upgradeable
+{
+    using AddressUpgradeable for address payable;
+    using ECDSAUpgradeable for bytes32;
     /* ========== STORAGE ========== */
 
     /// @notice STATUS
@@ -51,6 +59,12 @@ contract Geegs is ERC721, Ownable, ReentrancyGuard, EIP712 {
         BURNED
     }
 
+    enum MINT {
+        WHITELIST,
+        EARLYACCESS,
+        PUBLIC
+    }
+
     struct Document {
         address talent;
         address hirer;
@@ -58,6 +72,12 @@ contract Geegs is ERC721, Ownable, ReentrancyGuard, EIP712 {
         STATUS status;
         uint256 disputedAt;
         uint256 platformFee;
+    }
+
+    struct ExperienceBadge {
+        bytes32 jobTitle;
+        bytes32 hirer;
+        bool verified;
     }
 
     /// @notice RESOLVER
@@ -75,13 +95,20 @@ contract Geegs is ERC721, Ownable, ReentrancyGuard, EIP712 {
     string public baseURI;
     address public feeWallet;
     uint256 public gracePeriod;
+    uint256 public whitelistPrice;
+    uint256 public eaPrice;
+    uint256 public publicPrice;
     bool public paused;
     bool public restrictedOperator;
+
+    bytes32 public whitelistRoot;
+    bytes32 public eaRoot;
 
     IFeeStructure public feeStructure;
 
     mapping(uint256 => uint256) public transferAllowance;
     mapping(uint256 => Document) public documents;
+    mapping(uint256 => ExperienceBadge) public exps;
     mapping(bytes => bool) public usedSignature;
     mapping(address => bool) public operators;
     mapping(uint256 => bool) public sbt;
@@ -99,15 +126,20 @@ contract Geegs is ERC721, Ownable, ReentrancyGuard, EIP712 {
             "AcceptDocument(address talent,address hirer,uint256 docId,uint256 wage)"
         );
 
+    bytes32 private constant DISPUTE_TYPEHASH =
+        keccak256("RaiseDispute(address delegator,uint256 id)");
+
     /* ========== CONSTRUCTOR ========== */
 
-    constructor(
+    function initialize(
         string memory baseURI_,
         address _feeStructure
-    )
-        ERC721("Employment Contract", "GEEGS")
-        EIP712("Employment Contract", "1.0")
-    {
+    ) public initializer {
+        __Ownable_init(msg.sender);
+        __ReentrancyGuard_init();
+        __ERC721_init("Employment Contract", "GEEGS");
+        __EIP712_init("Employment Contract", "1.0");
+
         baseURI = baseURI_;
         feeStructure = IFeeStructure(_feeStructure);
     }
@@ -141,9 +173,13 @@ contract Geegs is ERC721, Ownable, ReentrancyGuard, EIP712 {
         uint256 indexed payableB
     );
 
+    event PastMint(uint256 indexed jobId, uint256 offChainId);
+    event PastVerified(uint256 indexed jobId);
+
     /* ========== ERRORS ========== */
     error Unauthorized();
     error InvalidSignature();
+    error NoSignature();
     error BadStatus();
     error Insufficient();
 
@@ -167,6 +203,21 @@ contract Geegs is ERC721, Ownable, ReentrancyGuard, EIP712 {
 
     function togglePause() external onlyOwner {
         paused = !paused;
+    }
+
+    function setPrice(
+        uint256 whitelist_,
+        uint256 ea_,
+        uint256 public_
+    ) external onlyOwner {
+        whitelistPrice = whitelist_;
+        eaPrice = ea_;
+        publicPrice = public_;
+    }
+
+    function setRoot(bytes32 whitelist_, bytes32 ea_) external onlyOwner {
+        whitelistRoot = whitelist_;
+        eaRoot = ea_;
     }
 
     function setOperator(
@@ -218,6 +269,60 @@ contract Geegs is ERC721, Ownable, ReentrancyGuard, EIP712 {
         emit TecCreated(_next, offChainId, doc.wage);
     }
 
+    function mintPastExperience(
+        bytes32 jobTitle_,
+        bytes32 hirer_,
+        bytes32[] calldata merkleProof_,
+        bool requestToVerify_,
+        uint256 offChainId,
+        MINT type_
+    ) external payable notPaused {
+        if (requestToVerify_) {
+            bytes32 leaf = keccak256(abi.encodePacked(msg.sender));
+            if (
+                type_ == MINT.WHITELIST &&
+                !(MerkleProofUpgradeable.verify(
+                    merkleProof_,
+                    whitelistRoot,
+                    leaf
+                ) && msg.value == whitelistPrice)
+            ) {
+                revert Unauthorized();
+            }
+            if (
+                type_ == MINT.EARLYACCESS &&
+                !(MerkleProofUpgradeable.verify(merkleProof_, eaRoot, leaf) &&
+                    msg.value == eaPrice)
+            ) {
+                revert Unauthorized();
+            }
+            if (type_ == MINT.PUBLIC && msg.value != publicPrice) {
+                revert Unauthorized();
+            }
+            (bool success, bytes memory data) = payable(feeWallet).call{
+                value: msg.value
+            }("");
+            if (!success)
+                assembly {
+                    revert(add(0x20, data), mload(data))
+                }
+        }
+
+        exps[nextTokenId] = ExperienceBadge(jobTitle_, hirer_, false);
+        _mint(msg.sender, nextTokenId);
+        emit PastMint(nextTokenId, offChainId);
+        nextTokenId++;
+    }
+
+    function verifyPastExperience(
+        uint256 tokenId
+    ) external notPaused onlyOwner {
+        ExperienceBadge storage badge = exps[tokenId];
+        if (badge.verified) revert BadStatus();
+        badge.verified = true;
+        emit PastVerified(tokenId);
+    }
+
     function burn(uint256 jobId) external {
         Document storage doc = documents[jobId];
         if (msg.sender != doc.hirer) revert Unauthorized();
@@ -249,31 +354,17 @@ contract Geegs is ERC721, Ownable, ReentrancyGuard, EIP712 {
         if (usedSignature[signature]) revert InvalidSignature();
         usedSignature[signature] = true;
 
-        // Here we validate the EIP712 signature
-        bytes32 domainSeparator = keccak256(
-            abi.encode(
-                EIP712_DOMAIN_TYPEHASH,
-                keccak256(bytes("Employment Contract")),
-                keccak256(bytes("1.0")),
-                getChainId(),
-                address(this)
+        address signer = _hashTypedDataV4(
+            keccak256(
+                abi.encode(
+                    ACCEPT_DOCUMENT_TYPEHASH,
+                    doc.talent,
+                    doc.hirer,
+                    jobId,
+                    doc.wage
+                )
             )
-        );
-
-        bytes32 structHash = keccak256(
-            abi.encode(
-                ACCEPT_DOCUMENT_TYPEHASH,
-                doc.talent,
-                doc.hirer,
-                jobId,
-                doc.wage
-            )
-        );
-
-        bytes32 digest = keccak256(
-            abi.encodePacked("\x19\x01", domainSeparator, structHash)
-        );
-        address signer = ECDSA.recover(digest, signature);
+        ).recover(signature);
         require(signer == doc.talent, "Invalid signature");
         doc.status = STATUS.ACCEPTED;
 
@@ -303,7 +394,7 @@ contract Geegs is ERC721, Ownable, ReentrancyGuard, EIP712 {
     function dispute(uint256 id) external {
         Document storage doc = documents[id];
         if (doc.status >= STATUS.COMPLETED) revert BadStatus();
-        if (msg.sender != doc.talent || msg.sender != doc.hirer)
+        if (msg.sender != doc.talent && msg.sender != doc.hirer)
             revert Unauthorized();
         doc.status = STATUS.DISPUTE;
         doc.disputedAt = block.timestamp;
@@ -317,11 +408,10 @@ contract Geegs is ERC721, Ownable, ReentrancyGuard, EIP712 {
         if (doc.status < STATUS.DISPUTE || doc.status > STATUS.DISPUTE)
             revert BadStatus();
         _checkAndMark([signatureA, signatureB]);
-        bytes32 digest = keccak256(abi.encodePacked(msg.sender, resolver.id));
         _validateParties(
-            digest,
             [signatureA, signatureB],
-            [doc.talent, doc.hirer]
+            [doc.talent, doc.hirer],
+            resolver.id
         );
         doc.status = STATUS.RESOLVED;
         _resolve(resolver, [doc.talent, doc.hirer], doc.wage);
@@ -333,18 +423,20 @@ contract Geegs is ERC721, Ownable, ReentrancyGuard, EIP712 {
             revert BadStatus();
         if (doc.disputedAt + gracePeriod > block.timestamp)
             revert Unauthorized();
-        bytes32 digest = keccak256(abi.encodePacked(msg.sender, resolver.id));
         bytes memory signature;
         if (resolver.signatureA.length != 0) {
             signature = resolver.signatureA;
         } else if (resolver.signatureB.length != 0) {
             signature = resolver.signatureB;
-        } else revert InvalidSignature();
+        } else revert NoSignature();
 
         if (usedSignature[signature]) revert InvalidSignature();
         usedSignature[signature] = true;
-        bytes32 message = ECDSA.toEthSignedMessageHash(digest);
-        address signer = ECDSA.recover(message, signature);
+
+        address signer = _hashTypedDataV4(
+            keccak256(abi.encode(DISPUTE_TYPEHASH, msg.sender, resolver.id))
+        ).recover(signature);
+
         if (signer != doc.talent && signer != doc.hirer)
             revert InvalidSignature();
         doc.status = STATUS.RESOLVED;
@@ -354,13 +446,17 @@ contract Geegs is ERC721, Ownable, ReentrancyGuard, EIP712 {
     /* ========== INTERNAL FUNCTIONS ========== */
 
     function _validateParties(
-        bytes32 digest,
         bytes[2] memory signatures,
-        address[2] memory parties
-    ) internal pure {
-        bytes32 message = ECDSA.toEthSignedMessageHash(digest);
-        address signerA = ECDSA.recover(message, signatures[0]);
-        address signerB = ECDSA.recover(message, signatures[1]);
+        address[2] memory parties,
+        uint256 docId
+    ) internal view {
+        address signerA = _hashTypedDataV4(
+            keccak256(abi.encode(DISPUTE_TYPEHASH, msg.sender, docId))
+        ).recover(signatures[0]);
+        address signerB = _hashTypedDataV4(
+            keccak256(abi.encode(DISPUTE_TYPEHASH, msg.sender, docId))
+        ).recover(signatures[1]);
+
         if (signerA != parties[0] || signerB != parties[1])
             revert InvalidSignature();
     }
@@ -429,7 +525,7 @@ contract Geegs is ERC721, Ownable, ReentrancyGuard, EIP712 {
     function approve(
         address operator,
         uint256 tokenId
-    ) public override(ERC721) transferrable(tokenId) {
+    ) public virtual override(ERC721Upgradeable) transferrable(tokenId) {
         super.approve(operator, tokenId);
     }
 
@@ -437,16 +533,8 @@ contract Geegs is ERC721, Ownable, ReentrancyGuard, EIP712 {
         address from,
         address to,
         uint256 tokenId
-    ) public override(ERC721) transferrable(tokenId) {
+    ) public virtual override(ERC721Upgradeable) transferrable(tokenId) {
         super.transferFrom(from, to, tokenId);
-    }
-
-    function safeTransferFrom(
-        address from,
-        address to,
-        uint256 tokenId
-    ) public override(ERC721) transferrable(tokenId) {
-        super.safeTransferFrom(from, to, tokenId);
     }
 
     function safeTransferFrom(
@@ -454,7 +542,7 @@ contract Geegs is ERC721, Ownable, ReentrancyGuard, EIP712 {
         address to,
         uint256 tokenId,
         bytes memory data
-    ) public override(ERC721) transferrable(tokenId) {
+    ) public virtual override(ERC721Upgradeable) transferrable(tokenId) {
         super.safeTransferFrom(from, to, tokenId, data);
     }
 }
